@@ -87,9 +87,9 @@ func main() {
 		),
 		"test-watchdog",
 		watchdog.WithWatchdogDuration(time.Second),
-		watchdog.WithLogger(watchdog.NewStdLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		watchdog.WithLogger(watchdog.NewStdLogger(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelDebug,
-		})))),
+		}))),
 	)
 
 	err := lock.TryLockContext(context.TODO())
@@ -139,9 +139,10 @@ func main() {
 					redsync.WithExpiry(time.Second*2),
 				),
 				watchdog.WithWatchdogDuration(time.Second),
-				watchdog.WithLogger(watchdog.NewStdLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-					Level: slog.LevelDebug,
-				})))),
+				watchdog.WithLogger(watchdog.NewStdLogger(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+					AddSource: true,
+					Level:     slog.LevelDebug,
+				}))),
 			),
 		),
 	)

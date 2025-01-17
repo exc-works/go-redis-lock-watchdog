@@ -48,9 +48,9 @@ func TestRedisLock_TryLockContext(t *testing.T) {
 			),
 			"test-watchdog",
 			watchdog.WithWatchdogDuration(time.Second),
-			watchdog.WithLogger(watchdog.NewStdLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			watchdog.WithLogger(watchdog.NewStdLogger(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 				Level: slog.LevelDebug,
-			})))),
+			}))),
 		)
 		err := lock.TryLockContext(context.TODO())
 		require.NoError(t, err)
