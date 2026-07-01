@@ -2,6 +2,7 @@ package go_redis_lock_watchdog
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -44,7 +45,15 @@ type redisLock struct {
 	logger Logger
 
 	watchdogDuration time.Duration
-	watchdogDone     chan struct{}
+
+	delegateMu sync.Mutex
+	watchdogMu sync.Mutex
+
+	watchdog *watchdogState
+}
+
+type watchdogState struct {
+	cancel context.CancelFunc
 }
 
 // NewRedisLock creates a new RedisLock with the given name and options.
@@ -63,61 +72,106 @@ func NewRedisLock(
 }
 
 func (lock *redisLock) TryLockContext(ctx context.Context) error {
-	if err := lock.delegate.TryLockContext(ctx); err != nil {
+	lock.delegateMu.Lock()
+	err := lock.delegate.TryLockContext(ctx)
+	lock.delegateMu.Unlock()
+	if err != nil {
 		return err
 	}
-	lock.runWatchdog(ctx)
+	lock.runWatchdog()
 	return nil
 }
 
 func (lock *redisLock) LockContext(ctx context.Context) error {
-	if err := lock.delegate.LockContext(ctx); err != nil {
+	lock.delegateMu.Lock()
+	err := lock.delegate.LockContext(ctx)
+	lock.delegateMu.Unlock()
+	if err != nil {
 		return err
 	}
-	lock.runWatchdog(ctx)
+	lock.runWatchdog()
 	return nil
 }
 
 func (lock *redisLock) UnlockContext(ctx context.Context) (bool, error) {
-	lock.stopWatchdog() // stop watchdog first
+	lock.stopWatchdog()
 
+	lock.delegateMu.Lock()
+	defer lock.delegateMu.Unlock()
 	return lock.delegate.UnlockContext(ctx)
 }
 
 func (lock *redisLock) ExtendContext(ctx context.Context) (bool, error) {
-	return lock.delegate.UnlockContext(ctx)
+	lock.delegateMu.Lock()
+	defer lock.delegateMu.Unlock()
+	return lock.delegate.ExtendContext(ctx)
 }
 
-func (lock *redisLock) runWatchdog(ctx context.Context) {
+func (lock *redisLock) runWatchdog() {
 	if lock.watchdogDuration <= 0 {
 		return
 	}
 
-	lock.watchdogDone = make(chan struct{})
-	go func() {
+	lock.stopWatchdog()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	watchdog := &watchdogState{cancel: cancel}
+
+	lock.watchdogMu.Lock()
+	lock.watchdog = watchdog
+	lock.watchdogMu.Unlock()
+
+	go func(ctx context.Context, watchdog *watchdogState) {
 		ticker := time.NewTicker(lock.watchdogDuration)
-		defer ticker.Stop()
-		select {
-		case <-lock.watchdogDone:
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			ok, err := lock.delegate.ExtendContext(ctx)
-			if err != nil {
-				lock.logger.Errorf("failed to extend lock with %s: %v", lock.name, err)
-			} else if !ok {
-				lock.logger.Errorf("failed to extend lock with %s: lock not found", lock.name)
+		defer func() {
+			ticker.Stop()
+			watchdog.cancel()
+
+			lock.watchdogMu.Lock()
+			if lock.watchdog == watchdog {
+				lock.watchdog = nil
+			}
+			lock.watchdogMu.Unlock()
+		}()
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			} else {
+			case <-ticker.C:
+				extendCtx, extendCancel := context.WithTimeout(ctx, lock.watchdogDuration)
+				ok, err := lock.ExtendContext(extendCtx)
+				extendCancel()
+				if !ok {
+					if ctx.Err() != nil {
+						return
+					}
+					if err != nil {
+						lock.logger.Errorf("failed to extend lock with %s: %v", lock.name, err)
+					} else {
+						lock.logger.Errorf("failed to extend lock with %s: lock not found", lock.name)
+					}
+					return
+				}
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					lock.logger.Errorf("failed to extend lock with %s: %v", lock.name, err)
+					continue
+				}
 				lock.logger.Debugf("extend lock with %s success", lock.name)
 			}
 		}
-	}()
+	}(ctx, watchdog)
 }
 
 func (lock *redisLock) stopWatchdog() {
-	if lock.watchdogDone != nil {
-		close(lock.watchdogDone)
+	lock.watchdogMu.Lock()
+	watchdog := lock.watchdog
+	lock.watchdog = nil
+	lock.watchdogMu.Unlock()
+
+	if watchdog != nil {
+		watchdog.cancel()
 	}
 }
