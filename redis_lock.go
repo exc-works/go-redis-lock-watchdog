@@ -76,8 +76,8 @@ func NewRedisLock(
 
 func (lock *redisLock) TryLockContext(ctx context.Context) error {
 	lock.delegateMu.Lock()
+	defer lock.delegateMu.Unlock()
 	err := lock.delegate.TryLockContext(ctx)
-	lock.delegateMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -87,8 +87,8 @@ func (lock *redisLock) TryLockContext(ctx context.Context) error {
 
 func (lock *redisLock) LockContext(ctx context.Context) error {
 	lock.delegateMu.Lock()
+	defer lock.delegateMu.Unlock()
 	err := lock.delegate.LockContext(ctx)
-	lock.delegateMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -97,10 +97,9 @@ func (lock *redisLock) LockContext(ctx context.Context) error {
 }
 
 func (lock *redisLock) UnlockContext(ctx context.Context) (bool, error) {
-	lock.stopWatchdog()
-
 	lock.delegateMu.Lock()
 	defer lock.delegateMu.Unlock()
+	lock.stopWatchdog()
 	return lock.delegate.UnlockContext(ctx)
 }
 
