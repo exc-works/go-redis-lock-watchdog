@@ -2,8 +2,11 @@ package go_redis_lock_watchdog
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
+
+	"github.com/go-redsync/redsync/v4"
 )
 
 type RedisLock interface {
@@ -145,6 +148,10 @@ func (lock *redisLock) runWatchdog() {
 					if ctx.Err() != nil {
 						return
 					}
+					if err != nil && !isLockOwnershipLost(err) {
+						lock.logger.Errorf("failed to extend lock with %s: %v", lock.name, err)
+						continue
+					}
 					if err != nil {
 						lock.logger.Errorf("failed to extend lock with %s: %v", lock.name, err)
 					} else {
@@ -174,4 +181,20 @@ func (lock *redisLock) stopWatchdog() {
 	if watchdog != nil {
 		watchdog.cancel()
 	}
+}
+
+func isLockOwnershipLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errTaken *redsync.ErrTaken
+	if errors.As(err, &errTaken) {
+		return true
+	}
+	var errNodeTaken *redsync.ErrNodeTaken
+	if errors.As(err, &errNodeTaken) {
+		return true
+	}
+	return errors.Is(err, redsync.ErrExtendFailed) ||
+		errors.Is(err, redsync.ErrLockAlreadyExpired)
 }

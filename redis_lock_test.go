@@ -2,6 +2,7 @@ package go_redis_lock_watchdog_test
 
 import (
 	"context"
+	"errors"
 	"github.com/alicebob/miniredis/v2"
 	watchdog "github.com/exc-works/go-redis-lock-watchdog"
 	redsyncbuilder "github.com/exc-works/go-redis-lock-watchdog/redsync"
@@ -133,6 +134,30 @@ func TestRedisLock_WatchdogKeepsLockAcrossMultipleTicks(t *testing.T) {
 
 	contender := watchdog.NewRedisLock(builder, "test-watchdog-multiple-ticks")
 	require.Error(t, contender.TryLockContext(context.TODO()))
+}
+
+func TestRedisLock_WatchdogContinuesAfterTemporaryExtendError(t *testing.T) {
+	delegate := &fakeRedisLock{
+		extendResults: []extendResult{
+			{ok: false, err: errors.New("temporary redis error")},
+			{ok: true},
+		},
+		extendCalls: make(chan int, 2),
+	}
+	lock := watchdog.NewRedisLock(
+		func(string) watchdog.RedisLock {
+			return delegate
+		},
+		"test-watchdog-temporary-extend-error",
+		watchdog.WithWatchdogDuration(20*time.Millisecond),
+	)
+	require.NoError(t, lock.TryLockContext(context.TODO()))
+	defer func() {
+		_, _ = lock.UnlockContext(context.TODO())
+	}()
+
+	waitExtendCall(t, delegate.extendCalls)
+	waitExtendCall(t, delegate.extendCalls)
 }
 
 func TestRedisLock_WatchdogStopsAfterLockValueChanges(t *testing.T) {
@@ -300,4 +325,51 @@ func TestRedisLock_ConcurrentUnlockDoesNotPanic(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+type extendResult struct {
+	ok  bool
+	err error
+}
+
+type fakeRedisLock struct {
+	mu            sync.Mutex
+	extendResults []extendResult
+	extendCalls   chan int
+}
+
+func (f *fakeRedisLock) TryLockContext(context.Context) error {
+	return nil
+}
+
+func (f *fakeRedisLock) LockContext(context.Context) error {
+	return nil
+}
+
+func (f *fakeRedisLock) UnlockContext(context.Context) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeRedisLock) ExtendContext(context.Context) (bool, error) {
+	f.mu.Lock()
+	call := len(f.extendResults)
+	result := extendResult{ok: true}
+	if call > 0 {
+		result = f.extendResults[0]
+		f.extendResults = f.extendResults[1:]
+	}
+	f.mu.Unlock()
+
+	f.extendCalls <- call
+	return result.ok, result.err
+}
+
+func waitExtendCall(t *testing.T, calls <-chan int) {
+	t.Helper()
+
+	select {
+	case <-calls:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for watchdog extend call")
+	}
 }
