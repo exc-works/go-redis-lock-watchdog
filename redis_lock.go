@@ -3,10 +3,13 @@ package go_redis_lock_watchdog
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-redsync/redsync/v4"
+	"github.com/hashicorp/go-multierror"
 )
 
 type RedisLock interface {
@@ -148,21 +151,17 @@ func (lock *redisLock) runWatchdog() {
 						return
 					}
 					if err != nil && !isLockOwnershipLost(err) {
-						lock.logger.Errorf("failed to extend lock with %s: %v", lock.name, err)
+						lock.logger.Errorf("failed to extend lock with %s: %s", lock.name, formatExtendError(err))
 						continue
 					}
-					if err != nil {
-						lock.logger.Errorf("failed to extend lock with %s: %v", lock.name, err)
-					} else {
-						lock.logger.Errorf("failed to extend lock with %s: lock not found", lock.name)
-					}
+					lock.logger.Errorf("failed to extend lock with %s: %s", lock.name, formatExtendError(err))
 					return
 				}
 				if err != nil {
 					if ctx.Err() != nil {
 						return
 					}
-					lock.logger.Errorf("failed to extend lock with %s: %v", lock.name, err)
+					lock.logger.Errorf("failed to extend lock with %s: %s", lock.name, formatExtendError(err))
 					continue
 				}
 				lock.logger.Debugf("extend lock with %s success", lock.name)
@@ -196,4 +195,66 @@ func isLockOwnershipLost(err error) bool {
 	}
 	return errors.Is(err, redsync.ErrExtendFailed) ||
 		errors.Is(err, redsync.ErrLockAlreadyExpired)
+}
+
+func formatExtendError(err error) string {
+	if err == nil {
+		return "lock not found"
+	}
+
+	var multiErr *multierror.Error
+	if errors.As(err, &multiErr) {
+		if len(multiErr.Errors) == 0 {
+			return formatSingleExtendError(err)
+		}
+
+		parts := make([]string, 0, len(multiErr.Errors))
+		for i, child := range multiErr.Errors {
+			parts = append(parts, fmt.Sprintf("error[%d]=%s", i, formatSingleExtendError(child)))
+		}
+		return strings.Join(parts, "; ")
+	}
+
+	return formatSingleExtendError(err)
+}
+
+func formatSingleExtendError(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+
+	var redisErr *redsync.RedisError
+	if errors.As(err, &redisErr) {
+		return fmt.Sprintf("%T: node=%d err=%s", redisErr, redisErr.Node, formatSingleExtendError(redisErr.Err))
+	}
+
+	var nodeTaken *redsync.ErrNodeTaken
+	if errors.As(err, &nodeTaken) {
+		return fmt.Sprintf("%T: node=%d message=%s", nodeTaken, nodeTaken.Node, nonEmptyErrorMessage(err))
+	}
+
+	var taken *redsync.ErrTaken
+	if errors.As(err, &taken) {
+		return fmt.Sprintf("%T: nodes=%v message=%s", taken, taken.Nodes, nonEmptyErrorMessage(err))
+	}
+
+	switch {
+	case errors.Is(err, redsync.ErrLockAlreadyExpired):
+		return fmt.Sprintf("redsync.ErrLockAlreadyExpired: %s", redsync.ErrLockAlreadyExpired)
+	case errors.Is(err, redsync.ErrExtendFailed):
+		return fmt.Sprintf("redsync.ErrExtendFailed: %s", redsync.ErrExtendFailed)
+	default:
+		return fmt.Sprintf("%T: %s", err, nonEmptyErrorMessage(err))
+	}
+}
+
+func nonEmptyErrorMessage(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	message := err.Error()
+	if message == "" {
+		return "<empty error message>"
+	}
+	return message
 }

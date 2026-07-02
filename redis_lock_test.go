@@ -3,15 +3,18 @@ package go_redis_lock_watchdog_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/alicebob/miniredis/v2"
 	watchdog "github.com/exc-works/go-redis-lock-watchdog"
 	redsyncbuilder "github.com/exc-works/go-redis-lock-watchdog/redsync"
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/hashicorp/go-multierror"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -158,6 +161,106 @@ func TestRedisLock_WatchdogContinuesAfterTemporaryExtendError(t *testing.T) {
 
 	waitExtendCall(t, delegate.extendCalls)
 	waitExtendCall(t, delegate.extendCalls)
+}
+
+func TestRedisLock_WatchdogLogsExpandedMultiErrorAndStopsOnOwnershipLoss(t *testing.T) {
+	logger := &captureLogger{}
+	delegate := &fakeRedisLock{
+		extendResults: []extendResult{
+			{ok: false, err: multierror.Append(nil, &redsync.ErrNodeTaken{Node: 7})},
+		},
+		extendCalls: make(chan int, 2),
+	}
+	lock := watchdog.NewRedisLock(
+		func(string) watchdog.RedisLock {
+			return delegate
+		},
+		"test-watchdog-expanded-multierror",
+		watchdog.WithWatchdogDuration(20*time.Millisecond),
+		watchdog.WithLogger(logger),
+	)
+	require.NoError(t, lock.TryLockContext(context.TODO()))
+	defer func() {
+		_, _ = lock.UnlockContext(context.TODO())
+	}()
+
+	waitExtendCall(t, delegate.extendCalls)
+	require.Eventually(t, func() bool {
+		message := logger.joinedErrors()
+		return strings.Contains(message, "error[0]=") &&
+			strings.Contains(message, "redsync.ErrNodeTaken") &&
+			strings.Contains(message, "node=7")
+	}, 200*time.Millisecond, 10*time.Millisecond)
+
+	select {
+	case <-delegate.extendCalls:
+		t.Fatal("watchdog continued after ownership loss")
+	case <-time.After(80 * time.Millisecond):
+	}
+}
+
+func TestRedisLock_WatchdogLogsEmptyChildErrorMessage(t *testing.T) {
+	logger := &captureLogger{}
+	delegate := &fakeRedisLock{
+		extendResults: []extendResult{
+			{ok: false, err: multierror.Append(nil, emptyExtendError{})},
+			{ok: true},
+		},
+		extendCalls: make(chan int, 2),
+	}
+	lock := watchdog.NewRedisLock(
+		func(string) watchdog.RedisLock {
+			return delegate
+		},
+		"test-watchdog-empty-child-error",
+		watchdog.WithWatchdogDuration(20*time.Millisecond),
+		watchdog.WithLogger(logger),
+	)
+	require.NoError(t, lock.TryLockContext(context.TODO()))
+	defer func() {
+		_, _ = lock.UnlockContext(context.TODO())
+	}()
+
+	waitExtendCall(t, delegate.extendCalls)
+	waitExtendCall(t, delegate.extendCalls)
+	require.Eventually(t, func() bool {
+		message := logger.joinedErrors()
+		return strings.Contains(message, "error[0]=") &&
+			strings.Contains(message, "emptyExtendError") &&
+			strings.Contains(message, "<empty error message>")
+	}, 200*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestRedisLock_WatchdogLogsRedisErrorNodeAndInnerMessage(t *testing.T) {
+	logger := &captureLogger{}
+	delegate := &fakeRedisLock{
+		extendResults: []extendResult{
+			{ok: false, err: multierror.Append(nil, &redsync.RedisError{Node: 3, Err: emptyExtendError{}})},
+			{ok: true},
+		},
+		extendCalls: make(chan int, 2),
+	}
+	lock := watchdog.NewRedisLock(
+		func(string) watchdog.RedisLock {
+			return delegate
+		},
+		"test-watchdog-redis-error",
+		watchdog.WithWatchdogDuration(20*time.Millisecond),
+		watchdog.WithLogger(logger),
+	)
+	require.NoError(t, lock.TryLockContext(context.TODO()))
+	defer func() {
+		_, _ = lock.UnlockContext(context.TODO())
+	}()
+
+	waitExtendCall(t, delegate.extendCalls)
+	waitExtendCall(t, delegate.extendCalls)
+	require.Eventually(t, func() bool {
+		message := logger.joinedErrors()
+		return strings.Contains(message, "redsync.RedisError") &&
+			strings.Contains(message, "node=3") &&
+			strings.Contains(message, "<empty error message>")
+	}, 200*time.Millisecond, 10*time.Millisecond)
 }
 
 func TestRedisLock_WatchdogStopsAfterLockValueChanges(t *testing.T) {
@@ -372,4 +475,33 @@ func waitExtendCall(t *testing.T, calls <-chan int) {
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("timed out waiting for watchdog extend call")
 	}
+}
+
+type emptyExtendError struct{}
+
+func (emptyExtendError) Error() string {
+	return ""
+}
+
+type captureLogger struct {
+	mu     sync.Mutex
+	errors []string
+}
+
+func (c *captureLogger) Debugf(string, ...any) {}
+
+func (c *captureLogger) Infof(string, ...any) {}
+
+func (c *captureLogger) Warnf(string, ...any) {}
+
+func (c *captureLogger) Errorf(format string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errors = append(c.errors, fmt.Sprintf(format, args...))
+}
+
+func (c *captureLogger) joinedErrors() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.errors, "\n")
 }
